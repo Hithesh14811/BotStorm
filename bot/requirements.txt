@@ -1,0 +1,11 @@
+# Primary engine: Firefox fork with C++-level fingerprint spoofing.
+# No JS injection => no Function.prototype.toString leaks.
+camoufox[geoip]==0.4.11
+
+# Fallback engine: Playwright with the CDP/Runtime.enable leaks patched out.
+patchright==1.52.5
+
+# Preflight proxy geolocation so timezone/locale match the exit IP.
+httpx[socks]==0.28.1
+
+numpy==2.2.4
