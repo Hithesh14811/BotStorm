@@ -112,6 +112,91 @@ class Session:
             await asyncio.sleep(dt)
             self.x, self.y = px, py
 
+    # -- arrival -------------------------------------------------------------
+    async def _arrive_from(self, ref: str):
+        """
+        Attach a referrer to the top-level document request ONLY.
+
+        page.set_extra_http_headers({"Referer": ...}) applies the header to
+        every request the page makes -- stylesheets, scripts, images, XHR. A
+        real browser sends a same-origin Referer for subresources, so a site
+        whose own CSS arrives claiming `Referer: https://www.google.com/` is
+        broadcasting automation on every single asset fetch. One header, dozens
+        of impossible requests.
+
+        Route interception lets us set it on the navigation request alone, and
+        also lets us keep the Sec-Fetch-* set coherent: arriving via a link
+        click from another origin means sec-fetch-site: cross-site, which
+        Gecko would otherwise report as `none` for a programmatic goto and
+        contradict the Referer we just claimed.
+        """
+        state = {"done": False}
+
+        async def handler(route):
+            request = route.request
+            if (not state["done"]
+                    and request.resource_type == "document"
+                    and request.is_navigation_request()):
+                state["done"] = True
+                headers = dict(request.headers)
+                headers["referer"] = ref
+                headers["sec-fetch-site"] = "cross-site"
+                headers["sec-fetch-mode"] = "navigate"
+                headers["sec-fetch-dest"] = "document"
+                headers["sec-fetch-user"] = "?1"
+                await route.continue_(headers=headers)
+            else:
+                await route.continue_()
+
+        await self.page.route("**/*", handler)
+        return handler
+
+    async def verify_geometry(self):
+        """
+        Confirm the spoofed window geometry survives contact with real layout.
+
+        innerWidth/innerHeight are injected by Camoufox, but
+        documentElement.clientWidth/clientHeight come from the actual layout
+        engine measuring the actual OS window. If FIREFOX_CHROME_PX is wrong
+        for this build, the two disagree and that mismatch is trivially
+        detectable from JS. Logged rather than raised, so one bad guess does
+        not abort a run -- but it tells you exactly what to retune.
+        """
+        try:
+            g = await self.page.evaluate(
+                "() => ({iw: window.innerWidth, ih: window.innerHeight,"
+                " ow: window.outerWidth, oh: window.outerHeight,"
+                " cw: document.documentElement.clientWidth,"
+                " ch: document.documentElement.clientHeight,"
+                " dpr: window.devicePixelRatio,"
+                " sw: screen.width, sh: screen.height,"
+                " langs: navigator.languages, lang: navigator.language})"
+            )
+        except Exception:
+            return
+
+        want_w, want_h = self.p.profile["viewport"]
+        problems = []
+        # Scrollbar accounts for a few px of width, never of height.
+        if abs(g["cw"] - want_w) > 20:
+            problems.append(f"clientWidth={g['cw']} vs innerWidth={want_w}")
+        if abs(g["ch"] - want_h) > 4:
+            problems.append(f"clientHeight={g['ch']} vs innerHeight={want_h}")
+        if g["dpr"] != 1:
+            problems.append(f"devicePixelRatio={g['dpr']} (expected 1)")
+        if list(g["langs"] or []) != self.p.locales:
+            problems.append(f"languages={g['langs']} vs {self.p.locales}")
+        if g["lang"] != self.p.locale:
+            problems.append(f"language={g['lang']} vs {self.p.locale}")
+
+        if problems:
+            self.log("geometry_mismatch", problems=problems)
+            print(f"[warn] fingerprint mismatch: {'; '.join(problems)}",
+                  flush=True)
+        else:
+            self.log("geometry_ok", inner=[g["iw"], g["ih"]],
+                     outer=[g["ow"], g["oh"]], screen=[g["sw"], g["sh"]])
+
     # -- probes --------------------------------------------------------------
     async def probe(self, selector: str) -> tuple[list[dict], list[dict]]:
         try:
@@ -144,16 +229,24 @@ class Session:
     async def run(self, url: str, budget_s: float, do_forms: bool = True):
         start = time.time()
 
+        handler = None
         if self.rng.random() < C.WARM_REFERRER_PROB:
             ref = self.rng.choice([
                 "https://www.google.com/", "https://www.bing.com/",
                 "https://duckduckgo.com/", "https://www.google.co.in/",
             ])
-            await self.page.set_extra_http_headers({"Referer": ref})
+            handler = await self._arrive_from(ref)
             self.log("referrer", value=ref)
 
-        await self.page.goto(url, wait_until="domcontentloaded",
-                            timeout=30000)
+        try:
+            await self.page.goto(url, wait_until="domcontentloaded",
+                                timeout=30000)
+        finally:
+            if handler:
+                # Stop intercepting the moment navigation is done: leaving a
+                # route active adds latency to every subsequent request, which
+                # is itself a measurable timing signature.
+                await self.page.unroute("**/*", handler)
         self.log("navigated", url=url)
 
         # Perception latency: a human cannot act on a page at t=0ms.
@@ -164,6 +257,8 @@ class Session:
             await self.page.wait_for_load_state("networkidle", timeout=6000)
         except Exception:
             pass
+
+        await self.verify_geometry()
 
         metrics = await self.page.evaluate(
             "() => ({h: document.documentElement.scrollHeight,"

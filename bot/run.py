@@ -69,10 +69,15 @@ async def run_one(idx: int, url: str, proxy: dict | None, headless: bool,
     budget = timing.session_budget(rng, per.bias.patience)
 
     print(f"[bot {idx:02d}] persona={per.profile['name']} os={per.os} "
-          f"geo={per.country} tz={per.timezone} dev={per.bias.device} "
-          f"budget={budget:.1f}s", flush=True)
+          f"geo={per.country} tz={per.timezone} langs={','.join(per.locales)} "
+          f"dev={per.bias.device} budget={budget:.1f}s", flush=True)
 
-    vw, vh = per.profile["viewport"]
+    # Camoufox's `window=` is the OUTER window size, not the viewport --
+    # generate_fingerprint() routes it straight into handle_window_size(), which
+    # assigns outerWidth/outerHeight. Handing it the viewport shrinks the real
+    # OS window by one chrome height, so the true layout viewport ends up
+    # shorter than the innerHeight we advertise.
+    ow, oh = P.outer_size(per.profile)
     result = {"idx": idx, "seed": seed, "ok": False}
 
     try:
@@ -81,10 +86,12 @@ async def run_one(idx: int, url: str, proxy: dict | None, headless: bool,
             proxy=proxy,
             geoip=True,           # align tz/locale/geo to the exit IP
             humanize=False,       # we supply our own, richer humanisation
-            locale=per.locale,
+            # A LIST, not a string: Camoufox only populates `locale:all`
+            # (navigator.languages + Accept-Language) for 2+ locales.
+            locale=per.locales,
             os=[per.os],
             config=P.camoufox_config(per),
-            window=(vw, vh),
+            window=(ow, oh),
             block_webrtc=True,    # prevent the real LAN IP leaking via WebRTC
             i_know_what_im_doing=True,
         ) as browser:

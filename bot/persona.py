@@ -23,91 +23,131 @@ import httpx
 from config import PersonaBias
 
 
-# Real device profiles. Screen metrics, DPR and fonts are internally coherent.
+# Height of Firefox's own chrome (tab strip + nav toolbar, no bookmarks bar),
+# i.e. outerHeight - innerHeight. Horizontally Firefox has no window border on
+# any modern desktop OS, so outerWidth == innerWidth exactly.
+#
+# This delta is the geometry signal that matters. A window claiming
+# outerWidth == screen.width while innerWidth is 1536 implies 384px of
+# horizontal browser chrome, which cannot exist -- and it survives every
+# "inner <= outer <= avail <= screen" sanity check, so a detector that looks
+# at the *delta* rather than the ordering catches it immediately.
+FIREFOX_CHROME_PX = {"windows": 82, "macos": 74, "linux": 78}
+
+# OS furniture that reduces the available area. If availHeight == height AND
+# availWidth == width, CreepJS's noTaskbar flag fires -- a headless tell.
+TASKBAR_PX = {"windows": 40, "macos": 25, "linux": 27}
+
+
+# Real device profiles. Screen metrics and fonts are internally coherent.
 # Market-share weighted -- a rare resolution is itself an anomaly.
+#
+# "viewport" is the INNER (layout) size. Outer size is derived as
+# (innerWidth, innerHeight + chrome) by outer_size(), never stored, so the two
+# can never drift apart.
+#
+# devicePixelRatio is deliberately absent: Camoufox cannot spoof it coherently
+# (browserforge.yml: "devicePixelRatio is not recommended. Any value other
+# than 1.0 is suspicious"), and under Xvfb the real ratio is 1.0. A persona
+# claiming 2.0 contradicts matchMedia('(resolution: 2dppx)') and the real
+# rendering scale. So every profile is a genuine 1.0-DPR display, which rules
+# out Retina MacBook panels -- the macOS personas below are on external
+# monitors instead.
 DEVICE_PROFILES = [
     {
-        "name": "win11-1080p",
+        "name": "win11-1080p-max",
         "weight": 30,
         "os": "windows",
         "screen": (1920, 1080),
-        "avail": (1920, 1032),
-        "dpr": 1.0,
-        "viewport": (1536, 776),
+        "avail": (1920, 1040),
+        "avail_origin": (0, 0),
+        "viewport": (1920, 958),
+        "maximized": True,
         "cores": 8,
-        "memory": 8,
         "touch": 0,
     },
     {
-        "name": "win11-1440p",
-        "weight": 11,
+        "name": "win11-1080p-windowed",
+        "weight": 10,
+        "os": "windows",
+        "screen": (1920, 1080),
+        "avail": (1920, 1040),
+        "avail_origin": (0, 0),
+        "viewport": (1536, 776),
+        "maximized": False,
+        "cores": 8,
+        "touch": 0,
+    },
+    {
+        "name": "win11-1440p-max",
+        "weight": 9,
         "os": "windows",
         "screen": (2560, 1440),
-        "avail": (2560, 1392),
-        "dpr": 1.0,
-        "viewport": (2048, 1080),
+        "avail": (2560, 1400),
+        "avail_origin": (0, 0),
+        "viewport": (2560, 1318),
+        "maximized": True,
         "cores": 12,
-        "memory": 16,
         "touch": 0,
     },
     {
-        "name": "win10-laptop-768",
+        "name": "win10-laptop-768-max",
         "weight": 17,
         "os": "windows",
         "screen": (1366, 768),
         "avail": (1366, 728),
-        "dpr": 1.0,
-        "viewport": (1366, 641),
+        "avail_origin": (0, 0),
+        "viewport": (1366, 646),
+        "maximized": True,
         "cores": 4,
-        "memory": 8,
         "touch": 0,
     },
     {
-        "name": "win11-laptop-scaled",
-        "weight": 9,
+        "name": "win11-1536x864-max",
+        "weight": 12,
         "os": "windows",
         "screen": (1536, 864),
         "avail": (1536, 824),
-        "dpr": 1.25,
-        "viewport": (1536, 738),
+        "avail_origin": (0, 0),
+        "viewport": (1536, 742),
+        "maximized": True,
         "cores": 8,
-        "memory": 16,
         "touch": 0,
     },
     {
-        "name": "macbook-air-m2",
-        "weight": 13,
+        "name": "mac-1080p-external-max",
+        "weight": 9,
         "os": "macos",
-        "screen": (1470, 956),
-        "avail": (1470, 931),
-        "dpr": 2.0,
-        "viewport": (1470, 831),
+        "screen": (1920, 1080),
+        "avail": (1920, 1055),
+        "avail_origin": (0, 25),   # menu bar
+        "viewport": (1920, 981),
+        "maximized": True,
         "cores": 8,
-        "memory": 8,
         "touch": 0,
     },
     {
-        "name": "macbook-pro-14",
-        "weight": 8,
+        "name": "mac-1680x1050-max",
+        "weight": 5,
         "os": "macos",
-        "screen": (1512, 982),
-        "avail": (1512, 957),
-        "dpr": 2.0,
-        "viewport": (1512, 857),
-        "cores": 10,
-        "memory": 16,
+        "screen": (1680, 1050),
+        "avail": (1680, 1025),
+        "avail_origin": (0, 25),
+        "viewport": (1680, 951),
+        "maximized": True,
+        "cores": 8,
         "touch": 0,
     },
     {
-        "name": "linux-1080p",
+        "name": "linux-1080p-max",
         "weight": 3,
         "os": "linux",
         "screen": (1920, 1080),
         "avail": (1920, 1053),
-        "dpr": 1.0,
-        "viewport": (1920, 979),
+        "avail_origin": (0, 27),   # GNOME top bar
+        "viewport": (1920, 975),
+        "maximized": True,
         "cores": 8,
-        "memory": 16,
         "touch": 0,
     },
 ]
@@ -186,7 +226,8 @@ class Persona:
     webgl_vendor: str
     webgl_renderer: str
     fonts: list[str]
-    locale: str
+    locale: str            # primary tag, e.g. "en-IN" (drives the Intl API)
+    locales: list[str]     # full chain -> navigator.languages / Accept-Language
     timezone: str
     country: str | None
     latitude: float | None
@@ -219,20 +260,31 @@ def _weighted_choice(rng: random.Random, items: list[dict]) -> dict:
     return items[-1]
 
 
-# Country -> (timezone, locale). Extend as the organizers' proxy pool dictates.
+# Country -> (timezone, [locale chain]).
+#
+# The chain is a LIST, not a single tag, and that matters. Camoufox only emits
+# `locale:all` (which drives navigator.languages and Accept-Language) when it
+# is given two or more locales -- handle_locales() returns early on a
+# single-element list. Passing just "en-IN" therefore leaves navigator.languages
+# at whatever the randomly generated fingerprint happened to contain, so
+# navigator.language and navigator.languages[0] can disagree. That is a
+# zero-false-positive bot signal, and it is free to avoid.
+#
+# Real users almost always have a fallback chain: the bare region tag followed
+# by the base language, plus English for non-anglophone locales.
 GEO_DEFAULTS = {
-    "IN": ("Asia/Kolkata", "en-IN"),
-    "US": ("America/New_York", "en-US"),
-    "GB": ("Europe/London", "en-GB"),
-    "DE": ("Europe/Berlin", "de-DE"),
-    "FR": ("Europe/Paris", "fr-FR"),
-    "BR": ("America/Sao_Paulo", "pt-BR"),
-    "SG": ("Asia/Singapore", "en-SG"),
-    "AU": ("Australia/Sydney", "en-AU"),
-    "CA": ("America/Toronto", "en-CA"),
-    "NL": ("Europe/Amsterdam", "nl-NL"),
-    "JP": ("Asia/Tokyo", "ja-JP"),
-    "AE": ("Asia/Dubai", "en-AE"),
+    "IN": ("Asia/Kolkata", ["en-IN", "en", "hi"]),
+    "US": ("America/New_York", ["en-US", "en"]),
+    "GB": ("Europe/London", ["en-GB", "en"]),
+    "DE": ("Europe/Berlin", ["de-DE", "de", "en-US", "en"]),
+    "FR": ("Europe/Paris", ["fr-FR", "fr", "en-US", "en"]),
+    "BR": ("America/Sao_Paulo", ["pt-BR", "pt", "en-US", "en"]),
+    "SG": ("Asia/Singapore", ["en-SG", "en", "zh-CN", "zh"]),
+    "AU": ("Australia/Sydney", ["en-AU", "en"]),
+    "CA": ("America/Toronto", ["en-CA", "en", "fr-CA", "fr"]),
+    "NL": ("Europe/Amsterdam", ["nl-NL", "nl", "en-US", "en"]),
+    "JP": ("Asia/Tokyo", ["ja-JP", "ja", "en-US", "en"]),
+    "AE": ("Asia/Dubai", ["en-AE", "en", "ar"]),
 }
 
 
@@ -289,11 +341,12 @@ def build_persona(seed: str, proxy: str | None = None) -> Persona:
 
     geo = probe_proxy_geo(proxy) if proxy else {}
     country = geo.get("country")
-    tz_default, locale_default = GEO_DEFAULTS.get(
-        country or "", ("Asia/Kolkata", "en-IN")
+    tz_default, locale_chain = GEO_DEFAULTS.get(
+        country or "", ("Asia/Kolkata", ["en-IN", "en", "hi"])
     )
     timezone = geo.get("timezone") or tz_default
-    locale = locale_default
+    locales = list(locale_chain)
+    locale = locales[0]
 
     bias = PersonaBias(
         speed=rng.uniform(0.74, 1.34),
@@ -311,6 +364,7 @@ def build_persona(seed: str, proxy: str | None = None) -> Persona:
         webgl_renderer=renderer,
         fonts=fonts,
         locale=locale,
+        locales=locales,
         timezone=timezone,
         country=country,
         latitude=geo.get("latitude"),
@@ -319,30 +373,104 @@ def build_persona(seed: str, proxy: str | None = None) -> Persona:
     )
 
 
+def outer_size(profile: dict) -> tuple[int, int]:
+    """
+    Outer window size derived from the inner size. Firefox has no side border,
+    so outerWidth == innerWidth; vertically it adds the tab strip + nav bar.
+
+    This is also what must be handed to Camoufox's `window=` launch argument:
+    generate_fingerprint() documents that parameter as the *outer* size and
+    routes it through handle_window_size(), which sets outerWidth/outerHeight
+    directly. Passing the viewport there (as the launcher previously did) makes
+    the OS window one chrome-height too short and desynchronises the real
+    layout viewport from the spoofed innerHeight.
+    """
+    iw, ih = profile["viewport"]
+    return iw, ih + FIREFOX_CHROME_PX[profile["os"]]
+
+
+def validate_geometry(cfg: dict) -> None:
+    """
+    Fail loudly at build time rather than shipping an impossible window.
+
+    Camoufox normally guards this itself via fix_screen_no_taskbar() and
+    clamp_window_dimensions(), but utils.py gates both behind
+    `if not _user_set_screen_window:` -- so the moment we override any
+    screen.*/window.* key those safety nets switch off and whatever we inject
+    is reported verbatim. We therefore have to assert the invariants ourselves.
+    """
+    for axis, w in (("Width", "width"), ("Height", "height")):
+        screen = cfg[f"screen.{w}"]
+        avail = cfg[f"screen.avail{axis}"]
+        outer = cfg[f"window.outer{axis}"]
+        inner = cfg[f"window.inner{axis}"]
+        if not (inner <= outer <= avail <= screen):
+            raise ValueError(
+                f"impossible {axis.lower()} geometry: inner={inner} "
+                f"outer={outer} avail={avail} screen={screen}"
+            )
+
+    # noTaskbar tell: some OS furniture must always be occupying space.
+    if (cfg["screen.availWidth"] == cfg["screen.width"]
+            and cfg["screen.availHeight"] == cfg["screen.height"]):
+        raise ValueError("availWidth/Height equal screen -- noTaskbar tell")
+
+    if cfg["window.outerWidth"] != cfg["window.innerWidth"]:
+        raise ValueError("Firefox has no side border; outerWidth must equal "
+                         "innerWidth")
+
+    # Window must actually sit inside the screen.
+    if (cfg["window.screenX"] + cfg["window.outerWidth"] > cfg["screen.width"]
+            or cfg["window.screenY"] + cfg["window.outerHeight"]
+            > cfg["screen.height"]):
+        raise ValueError("window positioned partly off-screen")
+
+
 def camoufox_config(p: Persona) -> dict:
     """
     Map a persona onto Camoufox's fingerprint override surface. Camoufox applies
     these inside the Firefox C++ source, so there is no JS-visible patch, no
     toString leak, and no property-descriptor anomaly to find.
+
+    Key names are load-bearing. Camoufox's canonical screen keys are
+    `screen.width`, `screen.availHeight`, ... (see browserforge.yml). The
+    `window.screen.*` spelling used previously is not a recognised key, so the
+    entire device screen profile was silently discarded and every persona fell
+    back to a random BrowserForge screen unrelated to its own device identity.
     """
     sw, sh = p.profile["screen"]
     aw, ah = p.profile["avail"]
-    vw, vh = p.profile["viewport"]
-    return {
-        "window.screen.width": sw,
-        "window.screen.height": sh,
-        "window.screen.availWidth": aw,
-        "window.screen.availHeight": ah,
-        "window.screen.colorDepth": 24,
-        "window.screen.pixelDepth": 24,
-        "window.devicePixelRatio": p.profile["dpr"],
-        "window.innerWidth": vw,
-        "window.innerHeight": vh,
-        "window.outerWidth": sw,
-        "window.outerHeight": ah,
+    iw, ih = p.profile["viewport"]
+    ow, oh = outer_size(p.profile)
+    al, at = p.profile["avail_origin"]
+
+    if p.profile["maximized"]:
+        sx, sy = al, at
+    else:
+        # Centred, the way a freshly dragged-out window sits.
+        sx = max(al, (sw - ow) // 2)
+        sy = max(at, (sh - oh) // 2)
+
+    cfg = {
+        "screen.width": sw,
+        "screen.height": sh,
+        "screen.availWidth": aw,
+        "screen.availHeight": ah,
+        "screen.availLeft": al,
+        "screen.availTop": at,
+        "screen.colorDepth": 24,
+        "screen.pixelDepth": 24,
+        "window.innerWidth": iw,
+        "window.innerHeight": ih,
+        "window.outerWidth": ow,
+        "window.outerHeight": oh,
+        "window.screenX": sx,
+        "window.screenY": sy,
         "navigator.hardwareConcurrency": p.profile["cores"],
         "navigator.maxTouchPoints": p.profile["touch"],
         "webGl:vendor": p.webgl_vendor,
         "webGl:renderer": p.webgl_renderer,
         "fonts": p.fonts,
     }
+    validate_geometry(cfg)
+    return cfg
