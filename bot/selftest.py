@@ -195,6 +195,19 @@ def audit(fp: dict, per: P.Persona) -> list[str]:
     if lang and per.locale and lang.split("-")[0] != per.locale.split("-")[0]:
         bad.append(f"WARN navigator.language {lang!r} vs locale {per.locale!r}")
 
+    # navigator.languages must be the full persona chain AND its first element
+    # must equal navigator.language. A browser where those two disagree does
+    # not exist, so the mismatch is a zero-false-positive bot signal.
+    langs = list(fp.get("languages") or [])
+    if not langs:
+        bad.append("CRITICAL navigator.languages is empty")
+    elif langs != per.locales:
+        bad.append(f"CRITICAL navigator.languages {langs} != persona chain "
+                   f"{per.locales} -- Camoufox did not apply `locale:all`")
+    elif lang and langs[0] != lang:
+        bad.append(f"CRITICAL navigator.languages[0] {langs[0]!r} != "
+                   f"navigator.language {lang!r}")
+
     wg = fp.get("webgl") or {}
     if isinstance(wg, dict):
         rend = (wg.get("unmaskedRenderer") or wg.get("renderer") or "")
@@ -222,15 +235,27 @@ async def main():
     print(f"persona: {per.profile['name']} os={per.os} tz={per.timezone} "
           f"locale={per.locale}\n")
 
-    vw, vh = per.profile["viewport"]
+    # These launch arguments MUST be byte-for-byte what run.py uses, or the
+    # audit certifies a browser you never actually ship:
+    #   * `window=` is the OUTER size (see persona.outer_size), not the
+    #     viewport. Passing the viewport here makes the real OS window one
+    #     chrome-height too short, so documentElement.clientHeight disagrees
+    #     with the spoofed innerHeight -- and the selftest would be measuring
+    #     that broken geometry instead of the real one.
+    #   * `locale=` must be the full LIST. Camoufox's handle_locales() returns
+    #     early on a single-element list and never populates `locale:all`, so
+    #     navigator.languages keeps whatever the random fingerprint had and can
+    #     contradict navigator.language. Auditing with a bare string therefore
+    #     hides the exact inconsistency the audit exists to catch.
+    ow, oh = P.outer_size(per.profile)
     async with AsyncCamoufox(
         headless=False,
         geoip=False,
         humanize=False,
-        locale=per.locale,
+        locale=per.locales,
         os=[per.os],
         config=P.camoufox_config(per),
-        window=(vw, vh),
+        window=(ow, oh),
         block_webrtc=True,
         i_know_what_im_doing=True,
     ) as browser:

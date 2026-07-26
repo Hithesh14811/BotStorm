@@ -56,6 +56,13 @@ WORDS_PER_MINUTE = (190.0, 340.0)  # scanning, not careful reading
 IDLE_DRIFT_PROB = 0.45             # aimless cursor drift while reading
 HOVER_NO_CLICK_PROB = 0.5          # hover something you never click
 
+# Real people do not stare at one tab for a whole minute; they glance away.
+# A session with zero focus/blur and zero visibilitychange over 15+ seconds is
+# an explicit scored signal ("no focus/blur activity"), and it is one of the
+# few remaining behaviours our bot was not producing at all.
+TAB_AWAY_PROB = 0.4
+TAB_AWAY_S = (1.1, 4.2)
+
 
 # --- Fleet behaviour --------------------------------------------------------
 # Poisson arrivals. Uniform spacing between bots is a cross-session signal.

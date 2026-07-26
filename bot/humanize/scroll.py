@@ -29,7 +29,17 @@ def wheel_burst(rng: random.Random, device: str = "mouse",
         delta = rng.uniform(22.0, 64.0) * intensity
         decay = rng.uniform(0.86, 0.96)
         for _ in range(n):
-            out.append((delta * rng.uniform(0.86, 1.14) * direction,
+            # Round to a whole pixel. Firefox delivers trackpad wheel events in
+            # pixel deltaMode with INTEGER deltaY; a stream of values like
+            # 41.87 / 36.29 cannot come from any real input device, and it is
+            # cheap for a defender to test -- "what fraction of deltas are
+            # non-integer" is a one-line check with no false positives on real
+            # traffic. Rounding costs us nothing behaviourally and removes the
+            # single loudest signal the trackpad persona was emitting.
+            step = round(delta * rng.uniform(0.86, 1.14))
+            if step < 1:
+                break
+            out.append((float(step * direction),
                         rng.uniform(5.0, 14.0) / 1000.0))
             delta *= decay
             if abs(delta) < 6.0:

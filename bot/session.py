@@ -112,6 +112,60 @@ class Session:
             await asyncio.sleep(dt)
             self.x, self.y = px, py
 
+    async def tab_away(self):
+        """
+        Glance at another tab and come back.
+
+        Opening a real second tab makes Firefox fire genuine `blur` and
+        `visibilitychange` on our page, and `focus` + visible again on return.
+        These are trusted events produced by the browser itself -- we are not
+        dispatching anything, so isTrusted stays true, which is the whole point.
+
+        Doing it any other way is a trap: dispatchEvent(new Event('blur')) gives
+        isTrusted === false, and a single untrusted event is a 100-weight
+        instant fail. The expensive route is the only safe one.
+        """
+        try:
+            other = await self.page.context.new_page()
+        except Exception:
+            return
+        try:
+            await other.goto("about:blank")
+            await asyncio.sleep(self.rng.uniform(*C.TAB_AWAY_S))
+        except Exception:
+            pass
+        finally:
+            try:
+                await other.close()
+                # Bring ours back to the foreground explicitly; closing the
+                # other tab does not always re-focus us.
+                await self.page.bring_to_front()
+                self.log("tab_away")
+            except Exception:
+                pass
+        await asyncio.sleep(timing.reaction_delay(self.rng))
+
+    async def depart(self):
+        """
+        Leave like a closing tab, not like a killed process.
+
+        The class docstring always claimed we do this, but nothing actually
+        did: run() returned and the `async with AsyncCamoufox` block tore the
+        whole browser down. A hard teardown can kill the page before its
+        pagehide/beforeunload handlers run, so any defender collecting telemetry
+        on unload sees a session that simply stopped mid-stream -- which is both
+        unlike a real visit and liable to lose the tail of our own logs.
+
+        Closing the page with run_before_unload=True fires the handlers, and the
+        short sleep afterwards gives a keepalive beacon time to leave the socket.
+        """
+        try:
+            await self.page.close(run_before_unload=True)
+            await asyncio.sleep(self.rng.uniform(0.45, 1.1))
+            self.log("departed")
+        except Exception:
+            pass
+
     # -- arrival -------------------------------------------------------------
     async def _arrive_from(self, ref: str):
         """
@@ -278,6 +332,11 @@ class Session:
 
         links, _ = await self.probe("a[href]")
 
+        # Decide up front whether this persona ever glances away, so the
+        # decision is per-session rather than re-rolled on every read chunk
+        # (which would make the behaviour near-certain in long sessions).
+        tabbed_away = self.rng.random() >= C.TAB_AWAY_PROB
+
         for step in plan:
             if time.time() - start > budget_s * 0.8:
                 break
@@ -295,6 +354,14 @@ class Session:
                         await self.drift()
                     if links and self.rng.random() < 0.12:
                         await self.hover_something(links)
+                    # Glance away once, somewhere in the middle of the read --
+                    # not at t=0 (nobody opens a page to immediately leave it)
+                    # and not so late that we blow the time budget.
+                    if (not tabbed_away
+                            and 0.3 < (time.time() - start) / budget_s < 0.65
+                            and self.rng.random() < 0.14):
+                        tabbed_away = True
+                        await self.tab_away()
             else:
                 await asyncio.sleep(step["seconds"])
 
@@ -312,6 +379,7 @@ class Session:
                                 self.rng.uniform(0.4, 1.6))
 
         self.log("session_end", seconds=round(time.time() - start, 2))
+        await self.depart()
 
     async def maybe_fill_form(self, start: float, budget_s: float):
         fields, _ = await self.probe(
