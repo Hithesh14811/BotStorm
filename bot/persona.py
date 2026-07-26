@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import hashlib
 import random
+import re
 from dataclasses import dataclass
 
 import httpx
 
 from config import PersonaBias
+from hostcaps import OS_SIGNATURE_FONTS, HostCaps, assert_viable
 
 
 # Height of Firefox's own chrome (tab strip + nav toolbar, no bookmarks bar),
@@ -171,11 +173,45 @@ WEBGL_BY_OS = {
         ("Apple", "Apple M3"),
         ("Apple", "Apple M1"),
     ],
+    # Linux strings must name a real, consumer-grade GPU.
+    #
+    # The previous "llvmpipe (LLVM 15.0.7, 256 bits)" entry was an
+    # own-goal: lib/score.ts matches
+    #     /SwiftShader|llvmpipe|Mesa OffScreen|Software/i
+    # at weight 40, severity FATAL. Any persona that drew it auto-failed
+    # before doing anything else.
+    #
+    # We also avoid the substring "LLVM" altogether. A genuine radeonsi
+    # renderer really does report "... LLVM 15.0.7, DRM 3.49 ...", but a
+    # detector grepping the looser /llvm/i would still flag it, and we gain
+    # nothing by betting on the opponent's regex being precise.
+    #
+    # NB: never expose a datacenter accelerator here either. On a GPU node
+    # Firefox would report an NVIDIA H200 -- no human blog reader owns one,
+    # which is why the browser fleet must run on CPU nodes with the GPU
+    # hidden from the browser process.
     "linux": [
         ("Mesa", "Mesa Intel(R) UHD Graphics (CML GT2)"),
-        ("Mesa/X.org", "llvmpipe (LLVM 15.0.7, 256 bits)"),
+        ("Mesa", "Mesa Intel(R) Xe Graphics (TGL GT2)"),
+        ("Mesa", "Mesa Intel(R) HD Graphics 620 (KBL GT2)"),
+        ("AMD", "AMD Radeon RX 6600 (navi23, DRM 3.49)"),
     ],
 }
+
+
+# Anything matching this must never reach a fingerprint. Kept in sync with the
+# scorer's software-renderer test, plus "llvm" as a defensive superset.
+SOFTWARE_RENDERER_PAT = re.compile(
+    r"swiftshader|llvmpipe|llvm|mesa offscreen|software|virgl|vgem",
+    re.I,
+)
+
+# Datacenter parts a consumer machine cannot have. Guards against a real-GPU
+# leak if someone runs the fleet on an accelerator node by mistake.
+DATACENTER_GPU_PAT = re.compile(
+    r"\b(h100|h200|a100|l4|l40|t4|v100|tesla|quadro|rtx\s*6000\s*ada|grid)\b",
+    re.I,
+)
 
 
 FONTS_BY_OS = {
@@ -327,17 +363,73 @@ def probe_proxy_geo(proxy: str | None, timeout: float = 12.0) -> dict:
     return {}
 
 
-def build_persona(seed: str, proxy: str | None = None) -> Persona:
+class FontContradictionError(RuntimeError):
+    """Persona claims an OS whose fonts this host cannot rasterise."""
+
+
+def build_persona(
+    seed: str,
+    proxy: str | None = None,
+    caps: HostCaps | None = None,
+) -> Persona:
+    """
+    Build one coherent identity.
+
+    `caps` is the host font-capability probe. It is what stops us claiming an
+    OS we cannot back up: `public/probe.js` measures fonts by real render
+    width, so a persona may only claim an OS whose signature families actually
+    rasterise on this machine. On a bare Linux container that means Windows and
+    macOS personas are unavailable until the image ships real font packages --
+    and macOS never becomes available, because Apple's fonts are not
+    redistributable.
+    """
+    caps = assert_viable(caps)
     rng = random.Random(hashlib.sha256(seed.encode()).hexdigest())
 
-    profile = _weighted_choice(rng, DEVICE_PROFILES)
+    # Only consider devices whose OS this host can honestly impersonate.
+    # _weighted_choice renormalises over whatever survives, so market-share
+    # weighting is preserved within the viable subset.
+    candidates = [p for p in DEVICE_PROFILES if p["os"] in caps.viable_os]
+    if not candidates:
+        raise FontContradictionError(
+            "No device profile matches this host's viable OS set "
+            f"({caps.viable_os or 'none'}).\n" + caps.report()
+        )
+
+    profile = _weighted_choice(rng, candidates)
     os_name = profile["os"]
     vendor, renderer = rng.choice(WEBGL_BY_OS[os_name])
 
-    # Font list: take the OS base set and drop a few, as real installs vary.
-    base_fonts = FONTS_BY_OS[os_name][:]
-    drop = rng.sample(range(len(base_fonts)), k=rng.randint(0, 4))
+    if SOFTWARE_RENDERER_PAT.search(renderer):
+        raise ValueError(
+            f"software renderer would be fatal to the scorer: {renderer!r}"
+        )
+    if DATACENTER_GPU_PAT.search(renderer):
+        raise ValueError(
+            f"datacenter GPU is not a consumer device: {renderer!r}"
+        )
+
+    # Font list: start from the OS base set, then keep ONLY families this host
+    # can really render, so the claimed set equals the measurable set.
+    base_fonts = caps.fonts_for(os_name, FONTS_BY_OS[os_name])
+
+    # Real installs vary slightly, so drop a couple of *non-signature*
+    # families. Signature families are never dropped: a Windows box missing
+    # Arial is a bigger anomaly than one missing Gabriola.
+    signature = {f.lower() for f in OS_SIGNATURE_FONTS.get(os_name, [])}
+    droppable = [i for i, f in enumerate(base_fonts)
+                 if f.lower() not in signature]
+    drop = set(rng.sample(droppable, k=min(len(droppable), rng.randint(0, 4))))
     fonts = [f for i, f in enumerate(base_fonts) if i not in drop]
+
+    # The scorer flags <= 2 measurable fonts (weight 25). Fail loudly here
+    # rather than emitting a session that is guaranteed to be scored sparse.
+    if len(fonts) <= 2:
+        raise FontContradictionError(
+            f"only {len(fonts)} of the {os_name} font set rasterise on this "
+            "host; the scorer would flag this session as a container.\n"
+            + caps.report()
+        )
 
     geo = probe_proxy_geo(proxy) if proxy else {}
     country = geo.get("country")
@@ -472,5 +564,25 @@ def camoufox_config(p: Persona) -> dict:
         "webGl:renderer": p.webgl_renderer,
         "fonts": p.fonts,
     }
+
+    # Last line of defence. A Persona can be constructed directly (tests,
+    # replayed seeds, a future scheduler), so re-assert the renderer rules at
+    # the point the value actually reaches the browser.
+    if SOFTWARE_RENDERER_PAT.search(p.webgl_renderer):
+        raise ValueError(
+            f"refusing to launch with software renderer {p.webgl_renderer!r} "
+            "-- scorer treats this as fatal"
+        )
+    if DATACENTER_GPU_PAT.search(p.webgl_renderer):
+        raise ValueError(
+            f"refusing to launch with datacenter GPU {p.webgl_renderer!r} "
+            "-- no consumer device reports this"
+        )
+    if len(p.fonts) <= 2:
+        raise ValueError(
+            f"refusing to launch with {len(p.fonts)} fonts -- scorer flags "
+            "a sparse font set as a container tell"
+        )
+
     validate_geometry(cfg)
     return cfg
